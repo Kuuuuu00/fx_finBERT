@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+
+# uv
+.uv-cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# 환경변수 (API 키)
+.env
+.env.local
+
+# 데이터 (대용량/민감)
+data/raw/
+data/sampled/
+data/labeled/
+data/splits/
+data/inference/
+*.csv
+*.parquet
+!data/.gitkeep
+!**/.gitkeep
+
+# 모델 체크포인트
+models/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# 로그
+logs/
+*.log
+wandb/
+runs/
+
+# 결과물 (선택적 추적)
+results/*.png
+results/*.json
+!results/*.md
+
+# OS
+.DS_Store
+Thumbs.db
