@@ -1,31 +1,69 @@
-# Phase 6 파인튜닝 하이퍼파라미터
-model:
-  base_model: "DataWizardd/finbert-sentiment-ko"
-  num_labels: 3
+# Phase 4: 2단계 캐스케이드 파인튜닝 설정
+# 기반 모델: snunlp/KR-FinBert-SC
+# Stage A: extreme vs normal (이진 분류)
+# Stage B: extreme_down vs extreme_up (이진 분류, extreme 샘플만)
 
-training:
+stage_a:
+  base_model: "snunlp/KR-FinBert-SC"
+  num_labels: 2
+  id2label:
+    0: "normal"
+    1: "extreme"
   max_length: 256
   per_device_train_batch_size: 16
   per_device_eval_batch_size: 32
-  num_train_epochs: 4
-  learning_rate: 2.0e-5
-  warmup_ratio: 0.1
+  num_train_epochs: 8
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.15
   weight_decay: 0.01
   fp16: true
+  label_smoothing_factor: 0.1
   eval_strategy: "epoch"
   save_strategy: "epoch"
   load_best_model_at_end: true
-  metric_for_best_model: "f1_macro"
+  metric_for_best_model: "f2_extreme"
   greater_is_better: true
-  early_stopping_patience: 2
+  early_stopping_patience: 3
   seed: 42
+  output_dir: "./models/kr-finbert-fx-stage-a"
+
+stage_b:
+  base_model: "snunlp/KR-FinBert-SC"
+  num_labels: 2
+  id2label:
+    0: "extreme_down"
+    1: "extreme_up"
+  max_length: 256
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 32
+  num_train_epochs: 8
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.15
+  weight_decay: 0.01
+  fp16: true
+  label_smoothing_factor: 0.1
+  eval_strategy: "epoch"
+  save_strategy: "epoch"
+  load_best_model_at_end: true
+  metric_for_best_model: "balanced_accuracy"
+  greater_is_better: true
+  early_stopping_patience: 3
+  seed: 42
+  output_dir: "./models/kr-finbert-fx-stage-b"
+
+focal_loss:
+  gamma: 2.0
+  alpha_method: "sqrt_balanced"
 
 input:
-  # 하이브리드 입력: title [SEP] body[:max_body_len]
   max_body_len: 400
   use_title_body_concat: true
 
 output:
-  output_dir: "./models/kr-finbert-fx-final"
   logging_dir: "./logs/training"
   save_total_limit: 2
+  metrics_stage_a: "./results/training_metrics_stage_a.json"
+  metrics_stage_b: "./results/training_metrics_stage_b.json"
+  cascade_eval: "./results/cascade_evaluation.json"
+  curves_stage_a: "./results/training_curves_stage_a.png"
+  curves_stage_b: "./results/training_curves_stage_b.png"

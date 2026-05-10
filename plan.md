@@ -618,296 +618,573 @@ df['label_z1.5'] = df['z_score'].apply(lambda z: assign_label(z, 1.5))
 
 ---
 
-## Phase 4: 모델 파인튜닝
+## Phase 4: 2단계 캐스케이드 모델 파인튜닝
 
 ### 목표
-KR-FinBERT를 기반으로 환율 극단 변동 regime 분류기 학습. **z=1.5를 메인으로 학습**, z=1.0은 fallback 옵션으로 보류.
+KR-FinBERT를 기반으로 **2단계 캐스케이드(cascade) 분류기**를 학습한다. 단일 3-class 모델이 방향성 학습에 실패하는 문제를 해결하기 위해 task의 난이도를 분리한다.
 
-### 학습 전략 (교수 자문 후 변경)
+### 학습 전략 변경 이력 (2026-05-11)
 
-**Stage 1: z=1.5 모델 학습 (필수)**
-- 메인 임계값으로 학습 진행
-- Test 평가 후 성능 충족 여부 판단
+**초기 시도 (실패)**: 단일 3-class 모델 (extreme_down / normal / extreme_up)
+- 문제: class_weight 적용 후 모델이 96%를 extreme_down으로 예측하는 degenerate solution 발생
+- 원인: extreme_down과 extreme_up이 모두 ~10% 분포로 거의 같은 weight (3.27 vs 3.06)를 받아, 미세한 weight 차이가 학습 초기 random direction을 결정한 후 자기강화
+- 결과: extreme_recall 0.5063은 가짜 신호 (recall_down 0.98이 평균을 끌어올림, recall_up 0.03)
 
-**Stage 2: z=1.0 모델 학습 (조건부)**
-- Stage 1 결과가 다음 기준 미달 시에만 진행:
-  - Validation extreme_recall < 0.4
-  - 또는 Test extreme_recall이 random baseline + 0.1 미달
-- 미달 사유 분석 (data sparsity vs 신호 부재) 후 z=1.0으로 fallback
+**개선 전략**: 2단계 캐스케이드 학습 + Focal Loss
 
-**비교 분석 (선택)**
-- Stage 1 통과 시에도 학술적 비교 분석 목적으로 z=1.0 모델을 학습하는 것은 가능
-- 다만 Phase 5의 메인 평가는 z=1.5 모델 기준
+### 2단계 캐스케이드 구조
+
+**Stage A: 극단 vs 정상 이진 분류**
+```
+입력: 뉴스 텍스트
+출력: P(extreme), P(normal)
+라벨 매핑: (extreme_down, extreme_up) → 1 (extreme), normal → 0
+```
+이 단계는 "극단 변동의 가능성"만 판별. 방향성은 무시.
+
+**Stage B: 극단 내 방향성 분류 (down vs up)**
+```
+입력: 뉴스 텍스트 (Stage A에서 extreme으로 판정된 샘플만)
+출력: P(extreme_down), P(extreme_up)
+학습 데이터: extreme 라벨인 샘플만 (extreme_down + extreme_up)
+```
+이 단계는 "이미 극단으로 판정된 샘플"의 방향성 결정.
+
+### 캐스케이드 추론 파이프라인
+
+```python
+def cascade_predict(text, threshold=0.5):
+    """
+    2단계 캐스케이드 추론
+    
+    Returns:
+        final_label: 0 (extreme_down), 1 (normal), 2 (extreme_up)
+        extreme_score: P(extreme) from Stage A
+        direction_score: P(extreme_up) - P(extreme_down) from Stage B
+    """
+    # Stage A: 극단 가능성 점수
+    p_extreme = model_A(text)  # softmax[1]
+    
+    if p_extreme < threshold:
+        return 1, p_extreme, 0.0  # normal
+    
+    # Stage B: 방향성 결정
+    p_down, p_up = model_B(text)  # softmax
+    direction = p_up - p_down
+    
+    if p_up > p_down:
+        return 2, p_extreme, direction  # extreme_up
+    else:
+        return 0, p_extreme, direction  # extreme_down
+```
+
+### 학술적 정당화
+
+본 접근은 **divide-and-conquer** 패러다임의 표준 사례:
+- Multi-class 문제를 두 개의 binary task로 분해
+- 각 task의 난이도와 클래스 분포가 독립적으로 최적화 가능
+- 추론 시에도 해석 가능성 향상 ("얼마나 극단적인가" + "어느 방향인가")
+
+선행 사례:
+- 의료 영상 분류 (먼저 "병변 vs 정상", 다음 "병변 종류")
+- 이상 탐지 (anomaly detection → 이상 유형 분류)
 
 ### 핵심 설계 결정
 
 #### 결정 1: 기반 모델 선택
 
-**선정**: `snunlp/KR-FinBert-SC`
+**선정**: `snunlp/KR-FinBert-SC` (Stage A, B 모두 동일)
 
-`DataWizardd/finbert-sentiment-ko`는 감성 라벨로 학습되어 본 연구의 변동 regime 라벨과 의미가 다름. Warm start로 부적합. 헤드를 처음부터 학습하는 게 더 안전.
+#### 결정 2: Focal Loss 도입 (필수)
 
-#### 결정 2: z=1.5 우선 학습
+이전 학습 실패의 근본 원인은 class_weight + cross_entropy의 degenerate solution. **Focal Loss로 교체**:
 
-- `models/kr-finbert-fx-regime-z1.5/`: |z| ≥ 1.5 라벨로 학습 (**메인**)
-- `models/kr-finbert-fx-regime-z1.0/`: |z| ≥ 1.0 라벨로 학습 (**조건부**)
+```python
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha  # 클래스별 가중치
+        self.gamma = gamma  # focusing parameter
+    
+    def forward(self, logits, labels):
+        ce_loss = F.cross_entropy(logits, labels, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        return ((1 - pt) ** self.gamma * ce_loss).mean()
+```
 
-#### 결정 3: 클래스 불균형 처리 필수
+**Focal Loss 장점**:
+- "쉬운 샘플"의 손실을 자동 감소 → 모델이 어려운 샘플(방향성 구별 등)에 집중
+- class_weight를 약하게 써도 잘 작동 → degenerate solution 방지
+- `gamma=2.0`이 표준값
 
-z=1.5는 정상 클래스가 약 78~86%로 매우 unbalanced. **반드시 class_weight 적용**.
+#### 결정 3: 클래스 가중치 완화 (sqrt)
 
-20,000건 샘플 기준 예상 학습 데이터:
-- z=1.5 Train extreme: 약 3,100건 (양쪽 합) → 클래스당 ~1,500건 (충분)
-- z=1.5 Val/Test extreme: 각 약 280~340건 (안정적 평가 가능)
+```python
+balanced_weights = compute_class_weight('balanced', ...)
+alpha = torch.tensor(np.sqrt(balanced_weights), dtype=torch.float)
+# 예: balanced [4.62, 0.56] → sqrt [2.15, 0.75]
+```
+
+너무 강한 weight는 한쪽 쏠림을 유발. sqrt 완화로 균형.
+
+#### 결정 4: 학습 데이터 (z=1.5 유지)
+
+Stage A 학습 데이터:
+- normal (label=0): 11,701건 (Train)
+- extreme (label=1): 3,123건 (extreme_down 1,512 + extreme_up 1,611)
+- 비율: 79% / 21%
+
+Stage B 학습 데이터:
+- extreme_down (label=0): 1,512건
+- extreme_up (label=1): 1,611건
+- 비율: 48% / 52% (거의 균형)
+
+**Stage B의 장점**: 클래스 균형이 거의 1:1 → degenerate solution 위험 낮음.
 
 ### 입력
-- `data/splits/train.csv`, `val.csv`
+- `data/splits/train.csv`, `val.csv` (label_z1.5 컬럼 사용)
 
 ### 작업 내용
-**스크립트**: `scripts/04_finetune.py`
-**설정**: `configs/training_config.yaml`
 
-#### 1. 하이브리드 입력
+#### Step 1: 라벨 재매핑
+
+```python
+def remap_for_stage_a(label_z15):
+    """Stage A: extreme vs normal"""
+    if label_z15 in [0, 2]:  # extreme_down or extreme_up
+        return 1
+    elif label_z15 == 1:  # normal
+        return 0
+    return None
+
+def remap_for_stage_b(label_z15):
+    """Stage B: extreme 내에서만, down vs up"""
+    if label_z15 == 0:  # extreme_down
+        return 0
+    elif label_z15 == 2:  # extreme_up
+        return 1
+    return None  # normal은 Stage B 학습/평가에서 제외
+
+# Stage A 데이터: 모든 샘플
+train_df['label_a'] = train_df['label_z1.5'].apply(remap_for_stage_a)
+
+# Stage B 데이터: extreme 샘플만 필터링
+train_df_b = train_df[train_df['label_z1.5'].isin([0, 2])].copy()
+train_df_b['label_b'] = train_df_b['label_z1.5'].apply(remap_for_stage_b)
+```
+
+#### Step 2: 하이브리드 입력
 
 ```python
 def make_input(row, max_body_len=400):
     return f"{row['title']} [SEP] {row['body'][:max_body_len]}"
 ```
 
-#### 2. 모델 로드
+#### Step 3: 모델 로드 (각 Stage별)
 
 ```python
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-MODEL_NAME = "snunlp/KR-FinBert-SC"
-model = AutoModelForSequenceClassification.from_pretrained(
-    MODEL_NAME,
-    num_labels=3,
-    id2label={0: "extreme_down", 1: "normal", 2: "extreme_up"},
-    label2id={"extreme_down": 0, "normal": 1, "extreme_up": 2},
+# Stage A 모델
+model_a = AutoModelForSequenceClassification.from_pretrained(
+    "snunlp/KR-FinBert-SC",
+    num_labels=2,
+    id2label={0: "normal", 1: "extreme"},
+    label2id={"normal": 0, "extreme": 1},
 )
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+# Stage B 모델 (별도 인스턴스)
+model_b = AutoModelForSequenceClassification.from_pretrained(
+    "snunlp/KR-FinBert-SC",
+    num_labels=2,
+    id2label={0: "extreme_down", 1: "extreme_up"},
+    label2id={"extreme_down": 0, "extreme_up": 1},
+)
 ```
 
-#### 3. 하이퍼파라미터
-
-```yaml
-model:
-  base_model: "snunlp/KR-FinBert-SC"
-  num_labels: 3
-
-training:
-  max_length: 256
-  per_device_train_batch_size: 16
-  per_device_eval_batch_size: 32
-  num_train_epochs: 5
-  learning_rate: 2.0e-5
-  warmup_ratio: 0.1
-  weight_decay: 0.01
-  fp16: true
-  eval_strategy: "epoch"
-  save_strategy: "epoch"
-  load_best_model_at_end: true
-  metric_for_best_model: "f2_extreme"   # F-beta=2, 극단 클래스만
-  greater_is_better: true
-  early_stopping_patience: 2
-  seed: 42
-
-input:
-  max_body_len: 400
-  use_title_body_concat: true
-
-class_weight:
-  enabled: true
-  method: "balanced"
-
-output:
-  z1_0_dir: "./models/kr-finbert-fx-regime-z1.0"
-  z1_5_dir: "./models/kr-finbert-fx-regime-z1.5"
-```
-
-#### 4. 핵심 평가 지표 (Trainer compute_metrics)
-
-**기존 plan과 다른 가장 중요한 부분**. Macro-F1, Accuracy는 무의미. 극단 클래스 잡아내는 능력 중심:
+#### Step 4: Focal Trainer 구현
 
 ```python
-from sklearn.metrics import precision_score, recall_score, fbeta_score
+import torch.nn.functional as F
 
-def compute_metrics(eval_pred):
-    preds = np.argmax(eval_pred.predictions, axis=1)
-    labels = eval_pred.label_ids
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
     
-    precision_per_class = precision_score(labels, preds, average=None, labels=[0,1,2], zero_division=0)
-    recall_per_class = recall_score(labels, preds, average=None, labels=[0,1,2], zero_division=0)
-    
-    extreme_recall = (recall_per_class[0] + recall_per_class[2]) / 2
-    extreme_precision = (precision_per_class[0] + precision_per_class[2]) / 2
-    f2_extreme = fbeta_score(labels, preds, beta=2, average=None, labels=[0,2], zero_division=0).mean()
-    
-    return {
-        "extreme_recall": extreme_recall,
-        "extreme_precision": extreme_precision,
-        "f2_extreme": f2_extreme,
-        "recall_down": recall_per_class[0],
-        "recall_up": recall_per_class[2],
-        "precision_down": precision_per_class[0],
-        "precision_up": precision_per_class[2],
-    }
-```
+    def forward(self, logits, labels):
+        ce_loss = F.cross_entropy(logits, labels, weight=self.alpha, reduction='none')
+        pt = torch.exp(-ce_loss)
+        return ((1 - pt) ** self.gamma * ce_loss).mean()
 
-**왜 F-beta=2인가**:
-- Early warning에서는 **놓치는 비용 (FN) > 잘못 경보 비용 (FP)**
-- F-beta=2는 recall에 2배 가중치
-- 극단 변동 놓치는 것이 더 큰 손실
 
-#### 5. 클래스 가중치 Trainer
-
-```python
-import torch.nn as nn
-
-class WeightedTrainer(Trainer):
-    def __init__(self, class_weights, *args, **kwargs):
+class FocalTrainer(Trainer):
+    def __init__(self, alpha=None, gamma=2.0, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.class_weights = class_weights
+        self.focal_loss = FocalLoss(alpha=alpha, gamma=gamma)
     
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
-        loss_fct = nn.CrossEntropyLoss(weight=self.class_weights.to(model.device))
-        loss = loss_fct(outputs.logits, labels)
+        loss = self.focal_loss(outputs.logits, labels.to(model.device))
         return (loss, outputs) if return_outputs else loss
 ```
 
-#### 6. 학습 루프
+#### Step 5: 평가 지표 (Stage별)
 
-**Stage 1: z=1.5 우선 학습**
-
+**Stage A 지표** (extreme 검출):
 ```python
-# z=1.5 메인 학습
-train_df, val_df = load_splits(label_col="label_z1.5")
-class_weights = compute_class_weight("balanced", classes=[0,1,2], y=train_df['label'])
-
-trainer_z15 = WeightedTrainer(
-    class_weights=torch.tensor(class_weights, dtype=torch.float),
-    model=model, args=training_args,
-    train_dataset=train_ds, eval_dataset=val_ds,
-    compute_metrics=compute_metrics,
-)
-trainer_z15.train()
-trainer_z15.save_model("./models/kr-finbert-fx-regime-z1.5")
-
-# Validation 결과 평가
-val_metrics = trainer_z15.evaluate()
-print(f"z=1.5 Validation extreme_recall: {val_metrics['eval_extreme_recall']:.3f}")
-```
-
-**Stage 2 (조건부): z=1.0 fallback 학습**
-
-```python
-# 사용자 결정: z=1.5 결과 보고 z=1.0 학습 여부 판단
-# Validation extreme_recall < 0.4 이거나
-# Test 평가 후 random baseline + 0.1 미달 시 진행
-
-run_z10_fallback = False  # 사용자가 결과 보고 True로 설정
-
-if run_z10_fallback:
-    # 새로운 model 인스턴스로 시작 (z=1.5 학습 결과와 분리)
-    model = AutoModelForSequenceClassification.from_pretrained(
-        "snunlp/KR-FinBert-SC",
-        num_labels=3,
-        id2label={...}, label2id={...},
+def compute_metrics_a(eval_pred):
+    logits = eval_pred.predictions
+    preds = np.argmax(logits, axis=1)
+    labels = eval_pred.label_ids
+    
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels, preds, average=None, labels=[0, 1], zero_division=0
     )
     
-    train_df, val_df = load_splits(label_col="label_z1.0")
-    class_weights = compute_class_weight("balanced", classes=[0,1,2], y=train_df['label'])
+    extreme_recall = recall[1]
+    extreme_precision = precision[1]
+    f2_extreme = fbeta_score(labels, preds, beta=2, pos_label=1, zero_division=0)
     
-    trainer_z10 = WeightedTrainer(...)
-    trainer_z10.train()
-    trainer_z10.save_model("./models/kr-finbert-fx-regime-z1.0")
+    # 확률 기반 평가
+    probs = torch.softmax(torch.tensor(logits), dim=-1)[:, 1].numpy()
+    auc = roc_auc_score(labels, probs) if len(set(labels)) > 1 else 0.0
+    
+    return {
+        "extreme_recall": extreme_recall,        # 핵심 지표
+        "extreme_precision": extreme_precision,
+        "f2_extreme": f2_extreme,                 # metric_for_best_model
+        "recall_normal": recall[0],
+        "balanced_accuracy": (recall[0] + recall[1]) / 2,
+        "roc_auc": auc,
+    }
 ```
 
-각 학습 약 15~25분 (4070 Ti, 5 epoch, 20,000건 기준).
+**Stage B 지표** (방향성 분류):
+```python
+def compute_metrics_b(eval_pred):
+    logits = eval_pred.predictions
+    preds = np.argmax(logits, axis=1)
+    labels = eval_pred.label_ids
+    
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels, preds, average=None, labels=[0, 1], zero_division=0
+    )
+    
+    return {
+        "accuracy": (preds == labels).mean(),
+        "recall_down": recall[0],
+        "recall_up": recall[1],
+        "precision_down": precision[0],
+        "precision_up": precision[1],
+        "f1_macro": f1.mean(),                    # metric_for_best_model
+        "balanced_accuracy": (recall[0] + recall[1]) / 2,  # 핵심 지표
+        "direction_balance": abs(recall[0] - recall[1]),   # 0에 가까울수록 좋음
+    }
+```
+
+#### Step 6: 학습 루프
+
+**Stage A 학습** (extreme vs normal):
+
+```python
+# Stage A 데이터
+train_a = train_df.copy()
+val_a = val_df.copy()
+# label_a는 모든 샘플에 부여됨
+
+# Class weights (sqrt 완화)
+class_weights_a = compute_class_weight(
+    'balanced', classes=np.array([0, 1]),
+    y=train_a['label_a'].values
+)
+alpha_a = torch.tensor(np.sqrt(class_weights_a), dtype=torch.float)
+
+trainer_a = FocalTrainer(
+    alpha=alpha_a, gamma=2.0,
+    model=model_a, args=training_args_a,
+    train_dataset=train_ds_a, eval_dataset=val_ds_a,
+    compute_metrics=compute_metrics_a,
+)
+trainer_a.train()
+trainer_a.save_model("./models/kr-finbert-fx-stage-a")
+```
+
+**Stage B 학습** (extreme 내 방향):
+
+```python
+# Stage B 데이터: extreme 샘플만 필터링
+train_b = train_df[train_df['label_z1.5'].isin([0, 2])].copy()
+val_b = val_df[val_df['label_z1.5'].isin([0, 2])].copy()
+# label_b 부여됨
+
+# Class weights (거의 균형이지만 일관성 유지)
+class_weights_b = compute_class_weight(
+    'balanced', classes=np.array([0, 1]),
+    y=train_b['label_b'].values
+)
+alpha_b = torch.tensor(np.sqrt(class_weights_b), dtype=torch.float)
+
+trainer_b = FocalTrainer(
+    alpha=alpha_b, gamma=2.0,
+    model=model_b, args=training_args_b,
+    train_dataset=train_ds_b, eval_dataset=val_ds_b,
+    compute_metrics=compute_metrics_b,
+)
+trainer_b.train()
+trainer_b.save_model("./models/kr-finbert-fx-stage-b")
+```
+
+#### Step 7: 캐스케이드 통합 평가
+
+두 모델 학습 후 Val 셋에 캐스케이드 추론 수행:
+
+```python
+def cascade_evaluate(val_df, model_a, model_b, threshold=0.5):
+    """
+    캐스케이드 통합 평가:
+    Stage A → (조건부) Stage B → 최종 3-class 라벨
+    """
+    final_preds = []
+    for text, true_label in zip(val_df['input_text'], val_df['label_z1.5']):
+        # Stage A
+        p_extreme = predict_proba(model_a, text)[1]
+        
+        if p_extreme < threshold:
+            final_preds.append(1)  # normal
+        else:
+            # Stage B
+            probs_b = predict_proba(model_b, text)
+            if probs_b[1] > probs_b[0]:
+                final_preds.append(2)  # extreme_up
+            else:
+                final_preds.append(0)  # extreme_down
+    
+    # 3-class confusion matrix 계산
+    labels = val_df['label_z1.5'].values
+    cm = confusion_matrix(labels, final_preds, labels=[0, 1, 2])
+    
+    # 클래스별 recall
+    recall_down = cm[0, 0] / cm[0].sum() if cm[0].sum() > 0 else 0
+    recall_normal = cm[1, 1] / cm[1].sum() if cm[1].sum() > 0 else 0
+    recall_up = cm[2, 2] / cm[2].sum() if cm[2].sum() > 0 else 0
+    
+    return {
+        "cascade_recall_down": recall_down,
+        "cascade_recall_normal": recall_normal,
+        "cascade_recall_up": recall_up,
+        "cascade_extreme_recall": (recall_down + recall_up) / 2,
+        "cascade_min_extreme_recall": min(recall_down, recall_up),
+        "confusion_matrix": cm,
+    }
+```
+
+### 하이퍼파라미터
+
+```yaml
+# configs/training_config.yaml
+
+stage_a:
+  base_model: "snunlp/KR-FinBert-SC"
+  num_labels: 2
+  max_length: 256
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 32
+  num_train_epochs: 8                      # 5 → 8 (천천히 학습)
+  learning_rate: 1.0e-5                    # 2e-5 → 1e-5
+  warmup_ratio: 0.15                       # 0.1 → 0.15
+  weight_decay: 0.01
+  fp16: true
+  label_smoothing_factor: 0.1              # 신규
+  eval_strategy: "epoch"
+  save_strategy: "epoch"
+  load_best_model_at_end: true
+  metric_for_best_model: "f2_extreme"
+  greater_is_better: true
+  early_stopping_patience: 3               # 2 → 3
+  seed: 42
+  output_dir: "./models/kr-finbert-fx-stage-a"
+
+stage_b:
+  base_model: "snunlp/KR-FinBert-SC"
+  num_labels: 2
+  max_length: 256
+  per_device_train_batch_size: 16
+  per_device_eval_batch_size: 32
+  num_train_epochs: 8
+  learning_rate: 1.0e-5
+  warmup_ratio: 0.15
+  weight_decay: 0.01
+  fp16: true
+  label_smoothing_factor: 0.1
+  eval_strategy: "epoch"
+  save_strategy: "epoch"
+  load_best_model_at_end: true
+  metric_for_best_model: "balanced_accuracy"  # 양방향 균형 핵심
+  greater_is_better: true
+  early_stopping_patience: 3
+  seed: 42
+  output_dir: "./models/kr-finbert-fx-stage-b"
+
+focal_loss:
+  gamma: 2.0
+  alpha_method: "sqrt_balanced"
+
+input:
+  max_body_len: 400
+  use_title_body_concat: true
+```
 
 ### 출력
-- `models/kr-finbert-fx-regime-z1.5/` (메인, 필수)
-- `models/kr-finbert-fx-regime-z1.0/` (조건부, fallback 시)
-- `results/training_metrics.json`
-- `results/training_curves.png`
+- `models/kr-finbert-fx-stage-a/` (Stage A 모델)
+- `models/kr-finbert-fx-stage-b/` (Stage B 모델)
+- `results/training_metrics_stage_a.json`
+- `results/training_metrics_stage_b.json`
+- `results/cascade_evaluation.json` (통합 평가)
+- `results/training_curves_stage_a.png`
+- `results/training_curves_stage_b.png`
 
-### 검증 체크 (z=1.5 기준)
-- [ ] Validation **extreme_recall ≥ 0.4**
-- [ ] Random baseline 대비 명확한 개선 (random은 약 0.33)
-- [ ] Train-Val gap ≤ 0.15 (극단 클래스 recall 기준)
-- [ ] Confusion matrix에서 클래스 0과 2가 서로 혼동되지 않는지 확인
-- [ ] **위 기준 미달 시 → Stage 2 (z=1.0 fallback) 결정**
+### 검증 체크
+
+**Stage A** (extreme 검출):
+- [ ] Validation **extreme_recall ≥ 0.5** (이전 0.4 기준 상향)
+- [ ] **balanced_accuracy ≥ 0.6** (degenerate solution 방지)
+- [ ] roc_auc ≥ 0.65
+- [ ] Train-Val gap ≤ 0.15
+
+**Stage B** (방향성 분류):
+- [ ] Validation **balanced_accuracy ≥ 0.55** (random=0.5)
+- [ ] **direction_balance ≤ 0.2** (한쪽 쏠림 없음)
+- [ ] recall_down과 recall_up 모두 0.4 이상
+
+**캐스케이드 통합**:
+- [ ] **min_extreme_recall ≥ 0.3** (양방향 모두 어느 정도 잡음)
+- [ ] cascade_extreme_recall ≥ 0.4
+- [ ] 3-class confusion matrix에서 클래스 0과 2 혼동 비율 < 30%
+
+### 학습 시간 예상
+- Stage A: 약 12~18분 (14,824건 train, 8 epoch, early stop 가능)
+- Stage B: 약 4~7분 (3,123건 train, 8 epoch, early stop 가능)
+- **합계: 약 16~25분**
+
+### Fallback 전략
+
+만약 Stage A/B 모두 학습 후에도 검증 기준 미달:
+
+**Plan A**: Stage B 데이터 부족이 원인일 수 있음 → z=1.0으로 확장
+- z=1.0 기준 Stage B extreme 합 약 7,800건 (z=1.5의 2.5배)
+- Stage A는 z=1.5 유지 (task 정의상 z=1.5가 적절)
+
+**Plan B**: Focal Loss gamma 증가 (2.0 → 3.0)
+- 더 어려운 샘플에 집중
+
+**Plan C**: 단순 이진 분류로 회귀 (extreme_up vs 나머지)
+- Stage B 폐기, extreme_down 정보 손실 감수
 
 ---
 
-## Phase 5: 모델 평가
+## Phase 5: 캐스케이드 모델 평가
 
 ### 목표
-Test set에서 두 모델 성능 평가 + Random/Majority baseline 비교 + 임계값 선택
+Test set에서 캐스케이드 통합 모델 성능 평가 + Random/Majority baseline 비교 + 단계별 진단
 
 ### 작업 내용
 **스크립트**: `scripts/05_evaluate.py`
 
-#### 1. 핵심 평가 지표
+#### 1. 단계별 평가 (Stage A, Stage B 독립)
 
-| 지표 | 의미 | 목표 |
-|---|---|---|
-| **Extreme Recall** | 극단 변동 놓치지 않기 | ≥ 0.4 |
-| **Extreme Precision** | 극단 예측의 정확성 | ≥ 0.3 |
-| **F-beta=2 (extreme)** | Recall 가중 종합 | ≥ 0.4 |
-| Macro-F1 | 학계 참고용 | 보고만 |
+**Stage A 평가** (Test 전체):
+- extreme_recall, extreme_precision, f2_extreme
+- ROC-AUC (확률 기반)
+- balanced_accuracy
 
-#### 2. Baseline 비교 (필수)
+**Stage B 평가** (Test extreme 샘플만):
+- recall_down, recall_up
+- balanced_accuracy
+- direction_balance
+
+#### 2. 캐스케이드 통합 평가 (Test 전체, 3-class)
 
 ```python
-baselines = {
-    "majority": "항상 정상 클래스 예측",
-    "random_uniform": "균등 무작위",
-    "random_proportional": "라벨 분포 따라 무작위",
-}
+cascade_metrics = cascade_evaluate(test_df, model_a, model_b, threshold=0.5)
+# 출력: 3x3 confusion matrix, 클래스별 recall/precision
 ```
 
-우리 모델이 이들 baseline 대비 명확히 우수해야 함.
+#### 3. 임계값 sensitivity 분석
 
-#### 3. 시기별 분해 평가
+Stage A의 threshold(기본 0.5)를 변경하면 P/R trade-off 가능:
 
-Test set을 시기별로 쪼개 성능 변동 확인:
-- 평온기 vs 변동기
-- 변동기에 더 잘 작동해야 의미 있음
+| Threshold | Stage A recall | Stage A precision | 의미 |
+|---|---|---|---|
+| 0.3 | 높음 | 낮음 | "의심스러우면 일단 통과" |
+| **0.5** | 균형 | 균형 | **기본값** |
+| 0.7 | 낮음 | 높음 | "확실한 것만" |
 
-#### 4. Error analysis
+Test set에서 threshold 0.3, 0.4, 0.5, 0.6, 0.7로 각각 평가하여 최적값 탐색.
 
-오분류 케이스 50건 추출 → 수동 분석:
-- False Negative (극단을 정상으로): 어떤 기사 놓쳤나
-- False Positive (정상을 극단으로): 모델이 무엇에 반응
-- Class 0 ↔ 2 혼동 (방향 반대): 방향성 학습 여부
+#### 4. Baseline 비교 (필수)
 
-#### 5. 임계값 비교
-
-| 항목 | z=1.0 | z=1.5 |
+| Baseline | 설명 | 기대 성능 |
 |---|---|---|
-| Train extreme 라벨 수 | ~600 | ~250 |
-| Extreme Recall | ? | ? |
-| Extreme Precision | ? | ? |
-| F-beta=2 | ? | ? |
-| 학습 안정성 | ? | ? |
+| Majority | 항상 normal 예측 | extreme_recall = 0 |
+| Random uniform | 균등 무작위 | extreme_recall ≈ 0.33 |
+| Random proportional | 라벨 분포 비례 | extreme_recall ≈ class ratio |
 
-이 결과로 어느 임계값을 다운스트림에 사용할지 결정.
+**우리 모델 목표**: Random uniform 대비 extreme_recall +0.1 이상 개선
+
+#### 5. 시기별 분해 평가
+
+Test set(2023.7~2026.4)을 시기별로 쪼개:
+- 2023.7~2023.12 (강달러 정점)
+- 2024.1~2024.12 (트럼프 당선기 포함)
+- 2025.1~2026.4 (최근)
+
+각 시기별 캐스케이드 성능 추적 → concept drift 진단.
+
+#### 6. Error analysis
+
+캐스케이드 오분류 케이스 50건 추출:
+- Stage A에서 놓친 extreme (FN at A)
+- Stage A 통과했지만 Stage B에서 방향 잘못 예측 (Stage B 실패)
+- Stage A 잘못 통과 (FP at A): normal을 extreme으로
+
+각 유형 분석으로 모델 약점 식별.
+
+#### 7. 단어 의존성 진단 (Concept Drift Robustness)
+
+```python
+# Permutation Importance
+def diagnose_word_dependency(model, text, target_words):
+    original_pred = predict(text)
+    for word in target_words:
+        masked_text = text.replace(word, "[MASK]")
+        masked_pred = predict(masked_text)
+        impact = abs(original_pred - masked_pred)
+```
+
+- 고유명사 (서브프라임, 코로나 등) 마스킹 시 예측 변화
+- 추상 어휘 (위기, 급등, 불안) 마스킹 시 예측 변화
+- 추상 어휘 영향 > 고유명사 영향 → 일반화 가능 패턴 학습 입증
 
 ### 출력
-- `results/evaluation_report.md`
-- `results/confusion_matrices/z1.0_test.png`, `z1.5_test.png`
+- `results/evaluation_report.md` (메인 리포트)
+- `results/cascade_confusion_matrix.png`
+- `results/stage_a_metrics.json`, `stage_b_metrics.json`
+- `results/cascade_metrics.json`
+- `results/threshold_sensitivity.csv`
 - `results/error_analysis_50.csv`
 - `results/baseline_comparison.csv`
+- `results/word_dependency_diagnosis.md`
 
 ### 검증 체크
-- [ ] Test extreme_recall ≥ Random baseline + 0.1
-- [ ] z=1.0과 z=1.5 모두 평가
+- [ ] **Stage A: extreme_recall ≥ 0.5**, balanced_accuracy ≥ 0.6
+- [ ] **Stage B: balanced_accuracy ≥ 0.55**, direction_balance ≤ 0.2
+- [ ] **캐스케이드 min_extreme_recall ≥ 0.3**
+- [ ] Random baseline 대비 extreme_recall +0.1 이상 개선
+- [ ] threshold sensitivity 분석 완료
 - [ ] Error analysis 50건 검토
 - [ ] 시기별 분해 평가 완료
+- [ ] 단어 의존성 진단 완료
 
 ---
 
@@ -927,37 +1204,74 @@ Test set을 시기별로 쪼개 성능 변동 확인:
 
 Phase 1의 Step 1, Step 2만 적용 (저작권 제거 + 형식 필터). 불용어 밀도 필터(Step 3)는 미적용 권장 — 다운스트림에서 모든 기사 활용 가능하게.
 
-#### 2. 추론
+#### 2. 캐스케이드 추론
 
 ```python
 from torch.nn.functional import softmax
 
-def predict_regime(texts, model, tokenizer, batch_size=64):
-    model.eval()
-    all_probs = []
+def cascade_inference(texts, model_a, model_b, tokenizer, batch_size=64, threshold=0.5):
+    """
+    11만 건에 대한 캐스케이드 추론.
+    Stage A 확률, Stage B 확률, 최종 라벨, 신호 모두 저장.
+    """
+    model_a.eval(); model_b.eval()
+    
+    all_probs_a = []
+    all_probs_b = []
+    
     for i in tqdm(range(0, len(texts), batch_size)):
-        batch = tokenizer(
-            texts[i:i+batch_size],
-            truncation=True, max_length=256,
-            padding=True, return_tensors="pt"
-        ).to("cuda")
+        batch_texts = texts[i:i+batch_size]
+        batch = tokenizer(batch_texts, truncation=True, max_length=256,
+                         padding=True, return_tensors="pt").to("cuda")
+        
         with torch.no_grad():
-            probs = softmax(model(**batch).logits, dim=-1).cpu().numpy()
-        all_probs.append(probs)
-    return np.vstack(all_probs)
+            # Stage A: extreme vs normal
+            probs_a = softmax(model_a(**batch).logits, dim=-1).cpu().numpy()
+            # Stage B: extreme_down vs extreme_up (모든 샘플에 추론, 사용은 조건부)
+            probs_b = softmax(model_b(**batch).logits, dim=-1).cpu().numpy()
+        
+        all_probs_a.append(probs_a)
+        all_probs_b.append(probs_b)
+    
+    return np.vstack(all_probs_a), np.vstack(all_probs_b)
 ```
 
-**hard label이 아닌 확률값 저장** (다운스트림에 풍부한 신호).
+**중요**: Stage B는 **모든 샘플에 추론**하되, 다운스트림에서 활용 시 Stage A의 extreme 확률로 가중.
 
-#### 3. 결과 저장
+#### 3. 결과 저장 (다운스트림 LSTM 입력용)
 
 ```python
-df['prob_extreme_down'] = probs[:, 0]
-df['prob_normal'] = probs[:, 1]
-df['prob_extreme_up'] = probs[:, 2]
-df['extreme_signal'] = probs[:, 0] + probs[:, 2]      # 극단 가능성 종합
-df['directional_signal'] = probs[:, 2] - probs[:, 0]  # 방향성 (-1: 하락, +1: 상승)
-df['predicted_label'] = probs.argmax(axis=1)
+# Stage A 출력
+df['prob_normal'] = probs_a[:, 0]
+df['prob_extreme'] = probs_a[:, 1]
+
+# Stage B 출력 (조건부 의미 있음)
+df['prob_dir_down'] = probs_b[:, 0]
+df['prob_dir_up'] = probs_b[:, 1]
+
+# 캐스케이드 통합 신호 (LSTM에 직접 사용 가능)
+df['extreme_signal'] = probs_a[:, 1]                    # 0~1, 극단 가능성
+df['directional_signal'] = (probs_a[:, 1] *             # 가중 방향성: -1 ~ +1
+                            (probs_b[:, 1] - probs_b[:, 0]))
+df['signed_extreme_up'] = probs_a[:, 1] * probs_b[:, 1] # 극단 상승 신호
+df['signed_extreme_down'] = probs_a[:, 1] * probs_b[:, 0] # 극단 하락 신호
+
+# 최종 라벨 (캐스케이드 추론)
+def assign_final_label(p_extreme, p_down, p_up, threshold=0.5):
+    if p_extreme < threshold:
+        return 1  # normal
+    return 2 if p_up > p_down else 0  # extreme_up or extreme_down
+
+df['predicted_label'] = df.apply(
+    lambda r: assign_final_label(r['prob_extreme'], r['prob_dir_down'], r['prob_dir_up']),
+    axis=1
+)
+```
+
+**다운스트림 LSTM에 권장하는 핵심 feature**:
+- `extreme_signal` (0~1): 극단 가능성의 강도
+- `directional_signal` (-1~+1): 가중 방향 (Stage A 확률로 약화)
+- `signed_extreme_up` (0~1): 극단 상승만의 신호 (early warning 핵심)
 ```
 
 `extreme_signal`과 `directional_signal`은 다운스트림 LSTM에서 직접 사용 가능한 형태.
@@ -990,13 +1304,13 @@ daily_signals = df.groupby('date').agg({
 
 ## 진행 체크리스트 (요약)
 
-- [ ] **Phase 0**: 불용어 사전 모듈화 (✅ 완료)
-- [ ] **Phase 1**: 뉴스 필터링 + FDR 환율 수집 + merge_asof 매핑 + 20,000건 샘플링
-- [ ] **Phase 2**: z-score 기반 라벨링 (z=1.0, z=1.5)
-- [ ] **Phase 3**: 시간순 train/val/test 분할
-- [ ] **Phase 4**: z=1.5 메인 모델 파인튜닝 (Stage 1) → 미달 시 z=1.0 fallback (Stage 2)
-- [ ] **Phase 5**: Test 평가 + baseline 비교 + fallback 여부 결정
-- [ ] **Phase 6**: 11만 건 전체 추론 + 일별 집계
+- [x] **Phase 0**: 불용어 사전 모듈화 (✅ 완료)
+- [x] **Phase 1**: 뉴스 필터링 + FDR 환율 수집 + merge_asof 매핑 + 20,000건 샘플링 (✅ 완료)
+- [x] **Phase 2**: z-score 기반 라벨링 (z=1.0, z=1.5) (✅ 완료)
+- [x] **Phase 3**: 시간순 train/val/test 분할 (✅ 완료)
+- [ ] **Phase 4**: 2단계 캐스케이드 학습 (Stage A: extreme 검출 + Stage B: 방향 분류)
+- [ ] **Phase 5**: 캐스케이드 통합 평가 + baseline 비교 + 단어 의존성 진단
+- [ ] **Phase 6**: 11만 건 캐스케이드 추론 + 일별 집계
 
 ---
 
@@ -1009,9 +1323,12 @@ daily_signals = df.groupby('date').agg({
 | **merge_asof dtype 불일치 에러** | **`news_date`와 `trade_date` 모두 `datetime64[ns]`로 명시 변환** |
 | **불용어 밀도 고정 임계값으로 과도 제거** | **DENSITY_PERCENTILE=90 동적 임계값 사용** (정상 기사도 매크로 단어 매칭 흔함) |
 | 주말/공휴일 발행 기사 매핑 오류 | merge_asof `direction='backward'`로 직전 영업일 자동 매핑 |
-| z=1.5 학습 안정성 (Stage 1 미달) | Stage 2 fallback (z=1.0) 학습 진행 — Phase 4 검증 체크에 명시 |
+| z=1.5 학습 안정성 (Stage 1 미달) | 2단계 캐스케이드 + Focal Loss로 전환 (현재 채택) |
 | 20,000건 샘플링 시 특정 월 결손 | 시간 균등 샘플링 시 가용 기사 수에 자동 적응, 연도별 분포 확인 |
-| 극단 클래스 0과 2 구별 못함 (방향성 실패) | Confusion matrix 모니터링, 이진 분류(극단 vs 정상)로 단순화 검토 |
+| **3-class 학습 시 한쪽 쏠림 (degenerate solution)** | **2단계 캐스케이드 학습으로 Stage A/B 난이도 분리** (이전 학습 실패 → 캐스케이드 전환) |
+| **Stage A degenerate (모두 normal 또는 모두 extreme)** | Focal Loss gamma 조정 (2.0→3.0), label smoothing, sqrt class weight |
+| **Stage B degenerate (한쪽 방향)** | direction_balance 모니터링, balanced_accuracy를 metric_for_best_model로 사용 |
+| **Stage B 데이터 부족** | z=1.0으로 확장하여 extreme 샘플 2.5배 증대 (fallback 옵션) |
 | 시기별 성능 편차 큼 | 학습 데이터에 모든 변동성 regime 포함 확인, 롤링 윈도우 크기 조정 |
 | 같은 날 발행 기사 동일 라벨 문제 | label_quality_report에 명시, reviewer 사전 대응 |
 | 사후 보도 기사 편향 | T+1~T+5 평균 사용으로 영향 완화, Error analysis에서 비율 보고 |
